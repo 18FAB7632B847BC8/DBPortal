@@ -1,18 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-    _interface_kafka.interface.py
-    ~~~~~~~~~~
-
-    this module implements the function consume messages from kafka with gevent and
-    offer relevant api for operation on if messages
-
-    :copyright (c) 2015 by Han Fu
-    :license: BSD, see LICENSE for more details.
-"""
-
-
 from gevent import monkey; monkey.patch_all()
 
 from kafka import KafkaConsumer
