@@ -2,6 +2,6 @@
 Code for system implementation.
 <p align="left">
     <br>
-    <img src="https://raw.githubusercontent.com/18FAB7632B847BC8/NIRD/master/NIRD/system/static/img/screenshot.JPG" width="400"/>
+    <img src="https://raw.githubusercontent.com/18FAB7632B847BC8/NIRD/master/NIRD/system/static/img/screenshot.JPG" width="600"/>
     <br>
 <p>
