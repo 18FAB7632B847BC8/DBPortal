@@ -1,15 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-    redis_kafkastream.py
-    ~~~~~~~~~~
-
-    this module implements the function to insert ETLed article into redis
-    :copyright (c) 2015 by Han Fu
-    :license: BSD, see LICENSE for more details.
-"""
-
 from gevent import monkey; monkey.patch_all()
 from redis import ConnectionError, StrictRedis, ConnectionPool
 from redis.sentinel import Sentinel
