@@ -1,18 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-    _interface_mysql.db.py
-    ~~~~~~~~~~
-
-    this module implements the low level interface of mysql, including multi-threading
-    connection access, sql-insertion preventing, transaction and connection maintain
-    and release, simple sql operation, etc.
-
-    :copyright (c) 2015 by Han Fu
-    :license: BSD, see LICENSE for more details.
-"""
-
 import threading
 import functools
 import logging
