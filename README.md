@@ -1,3 +1,3 @@
-# NIRD
+# DBPortal
 
-Code for paper: NIRD: Building a Natural Language Interface for Real-world Database Systems
+Code for paper: Natural Language to SQL Parsing for Large Multi-Domain Databases
