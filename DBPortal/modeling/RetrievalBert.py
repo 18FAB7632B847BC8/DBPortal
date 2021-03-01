@@ -37,6 +37,8 @@ class Bert(object):
                                               name='embeddings_position_embeddings')
         self.type_emb = EmbeddingLayer(self.type_num, self.embed_dim, scale=0.02,
                                        name="embeddings_token_type_embeddings")
+        self.outer_type_emb = EmbeddingLayer(2, self.embed_dim, scale=0.02,
+                                             name="embeddings_outer_token_type_embeddings")
 
         self.emb_layer_norm = LayerNormLayer(self.embed_dim, name="embeddings_LayerNorm")
 
@@ -44,7 +46,7 @@ class Bert(object):
             encoder_layer = self.init_block(i)
             self.encoder_layers.append(encoder_layer)
 
-        for layer in [self.word_emb, self.type_emb, self.pos_emb, self.emb_layer_norm]:
+        for layer in [self.word_emb, self.type_emb, self.pos_emb, self.outer_type_emb, self.emb_layer_norm]:
             for k, v in layer.tparams.iteritems():
                 self.tparams[self.name + '_' + layer.name + '_' + k] = v
 
@@ -133,7 +135,7 @@ class Bert(object):
 
         return out
 
-    def get_output(self, x, mask=None, in_train=True):
+    def get_output(self, x, x_type_outer, mask=None, in_train=True):
         # x: n_batch, n_timestep
         # x_type: n_batch, n_timestep
         n_samples = x.shape[0]
@@ -142,12 +144,14 @@ class Bert(object):
         x_type = tensor.zeros_like(x, dtype="int32")
         emb_x = emb_x.reshape([n_samples, n_timestep, self.embed_dim])
         emb_type = self.type_emb.get_output(x_type)
+        emb_outer_type = self.outer_type_emb.get_output(x_type_outer)
         emb_type = emb_type.reshape([n_samples, n_timestep, self.embed_dim])
+        emb_outer_type = emb_outer_type.reshape([n_samples, n_timestep, self.embed_dim])
 
         x_pos = tensor.arange(2, n_timestep + 2, dtype='int32')
         emb_pos = self.pos_emb.get_output(x_pos)  # n_timestep, n_emb
 
-        emb = emb_x + emb_pos[None, :, :] + emb_type
+        emb = emb_x + emb_pos[None, :, :] + emb_type + emb_outer_type
 
         emb = self.emb_layer_norm.get_output(emb)
 

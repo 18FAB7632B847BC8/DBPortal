@@ -80,7 +80,7 @@ class NL2SQL(BaseModel):
 
     def init_model(self):
         self.bert = Bert(token_num=self.token_num, embed_dim=self.emb_dim, bert_last_num=self.bert_last_num,
-                         encoder_num=self.bert_layer_num, head_num=self.bert_head_num,
+                         encoder_num=self.bert_layer_num, head_num=self.bert_head_num, hidden_num=self.emb_dim,
                          dropout_rate=self.dropout_rate_bert)
 
         self.encoder = NL2SQLEncoder(self.emb_dim, self.hid_dim, 32, self.foreign_dim, self.scale, trng=self.trng,
@@ -89,13 +89,14 @@ class NL2SQL(BaseModel):
         self.decoder = SimpleDecoder(self.hid_dim, self.emb_dim, self.decoder_num, self.decoder_head_num,
                                      self.foreign_dim, self.scale, self.dropout_rate, name="decoder", trng=self.trng)
 
-        self.type_0_emb_layer = EmbeddingLayer(self.type_0_num, self.emb_dim / 3, scale=self.scale,
+        self.type_0_emb_layer = EmbeddingLayer(self.type_0_num, self.emb_dim - self.emb_dim / 3 - self.hid_dim / 2,
+                                               scale=self.scale,
                                                name="type_0_emb_layer")
 
         self.type_1_emb_layer = EmbeddingLayer(self.type_1_num, self.emb_dim / 3, scale=self.scale,
                                                name="type_1_emb_layer")
 
-        self.type_2_emb_layer = EmbeddingLayer(self.type_2_num, self.emb_dim / 3, scale=self.scale,
+        self.type_2_emb_layer = EmbeddingLayer(self.type_2_num, self.hid_dim / 2, scale=self.scale,
                                                name="type_2_emb_layer")
 
         self.op_emb_layer = EmbeddingLayer(self.op_num, self.hid_dim / 4, scale=self.scale,
@@ -203,6 +204,7 @@ class NL2SQL(BaseModel):
 
         return emb_y_shifted
 
+
     @staticmethod
     def cross_entropy_loss(logit, y, y_mask=None):
         logit_shape = logit.shape
@@ -224,6 +226,49 @@ class NL2SQL(BaseModel):
 
             y_flat_idx = tensor.arange(y_flat.shape[0]) * logit_shape[1] + y_flat
             cost_y = log_probs.flatten()[y_flat_idx]  # n_samples
+
+        return cost_y
+
+    @staticmethod
+    def one_hot(x, n_class):
+        # x: n
+        assert x.ndim == 1
+        n = x.shape[0]
+        y = tensor.zeros((n, n_class), dtype="float32")
+        y = tensor.set_subtensor(y[tensor.arange(n), x], 1.)
+        return y
+
+    @staticmethod
+    def label_smooth(y, factor=0.):
+        assert y.ndim == 2
+        n_class = y.shape[1]
+        y *= (1. - factor)
+        y += (factor / n_class)
+
+        return y
+
+    def cross_entropy_loss_smooth(self, logit, y, y_mask=None, ctx_mask=None, factor=0.1):
+        logit_shape = logit.shape
+        y_flat = y.flatten()
+        if logit.ndim == 3:
+            # logit: n_batch, n_step, n_class
+            # y: n_batch, n_step
+            log_probs = -tensor.nnet.logsoftmax(logit.reshape([logit_shape[0] * logit_shape[1], logit_shape[2]]))
+            if ctx_mask is not None:
+                log_probs = log_probs.reshape(logit_shape)
+                log_probs = log_probs * ctx_mask
+                log_probs = log_probs.reshape([logit_shape[0] * logit_shape[1], logit_shape[2]])
+            y_onehot_smooth = self.label_smooth(self.one_hot(y_flat, logit_shape[2]), factor)
+            cost_y = tensor.sum(log_probs * y_onehot_smooth, axis=1)
+            cost_y = cost_y.reshape([logit_shape[0], logit_shape[1]])
+            cost_y = (cost_y * y_mask).sum(1)
+
+        else:
+            # logit: n_batch, n_class
+            # y: n_batch
+            log_probs = -tensor.nnet.logsoftmax(logit)
+            y_onehot_smooth = self.label_smooth(self.one_hot(y_flat, logit_shape[1]), factor)
+            cost_y = tensor.sum(log_probs * y_onehot_smooth, axis=1)  # n_samples
 
         return cost_y
 
@@ -325,9 +370,9 @@ class NL2SQL(BaseModel):
 
         n_batch, n_seq = input_sequence.shape
 
-        emb_type_0 = self.type_0_emb_layer.get_output(input_type_0).reshape([n_batch, n_seq, self.emb_dim / 3])
+        emb_type_0 = self.type_0_emb_layer.get_output(input_type_0).reshape([n_batch, n_seq, self.emb_dim - self.emb_dim / 3 - self.hid_dim / 2])
         emb_type_1 = self.type_1_emb_layer.get_output(input_type_1).reshape([n_batch, n_seq, self.emb_dim / 3])
-        emb_type_2 = self.type_2_emb_layer.get_output(input_type_2).reshape([n_batch, n_seq, self.emb_dim / 3])
+        emb_type_2 = self.type_2_emb_layer.get_output(input_type_2).reshape([n_batch, n_seq, self.hid_dim / 2])
 
         emb_type = tensor.concatenate([emb_type_0, emb_type_1, emb_type_2], axis=2)
 
@@ -388,22 +433,22 @@ class NL2SQL(BaseModel):
         logit_l = self.output_l.get_output(tensor.concatenate([emb_q, emb_p, emb_d], axis=1), activ="linear")
         logit_nf = self.output_nf.get_output(tensor.concatenate([emb_q, emb_p, emb_d], axis=1), activ="linear")
 
-        cost_column = self.cross_entropy_loss(logit_column, y_column, y_c_mask)
-        cost_op = self.cross_entropy_loss(logit_op, y_op, y_w_mask)
-        cost_agg = self.cross_entropy_loss(logit_agg, y_agg, y_cwo_mask)
-        cost_vls = self.cross_entropy_loss(logit_vls, y_vls, y_w_mask)
-        cost_vle = self.cross_entropy_loss(logit_vle, y_vle, y_w_mask)
-        cost_vrs = self.cross_entropy_loss(logit_vrs, y_vrs, y_w_mask)
-        cost_vre = self.cross_entropy_loss(logit_vre, y_vre, y_w_mask)
-        cost_cd = self.cross_entropy_loss(logit_cd, y_cd, y_cw_mask)
-        cost_vn = self.cross_entropy_loss(logit_vn, y_vn, y_w_mask)
-        cost_t = self.cross_entropy_loss(logit_t, y_t, y_t_mask)
-        cost_d = self.cross_entropy_loss(logit_d, y_d, None)
-        cost_co = self.cross_entropy_loss(logit_co, y_co, None)
-        cost_o = self.cross_entropy_loss(logit_o, y_o, None)
-        cost_c = self.cross_entropy_loss(logit_c, y_c, None)
-        cost_l = self.cross_entropy_loss(logit_l, y_l, None)
-        cost_nf = self.cross_entropy_loss(logit_nf, y_nf, None)
+        cost_column = self.cross_entropy_loss_smooth(logit_column, y_column, y_c_mask, h_mask[:, None, :])
+        cost_op = self.cross_entropy_loss_smooth(logit_op, y_op, y_w_mask, None)
+        cost_agg = self.cross_entropy_loss_smooth(logit_agg, y_agg, y_cwo_mask, None)
+        cost_vls = self.cross_entropy_loss_smooth(logit_vls, y_vls, y_w_mask, q_mask[:, None, :])
+        cost_vle = self.cross_entropy_loss_smooth(logit_vle, y_vle, y_w_mask, q_mask[:, None, :])
+        cost_vrs = self.cross_entropy_loss_smooth(logit_vrs, y_vrs, y_w_mask, q_mask[:, None, :])
+        cost_vre = self.cross_entropy_loss_smooth(logit_vre, y_vre, y_w_mask, q_mask[:, None, :])
+        cost_cd = self.cross_entropy_loss_smooth(logit_cd, y_cd, y_cw_mask, None)
+        cost_vn = self.cross_entropy_loss_smooth(logit_vn, y_vn, y_w_mask, None)
+        cost_t = self.cross_entropy_loss_smooth(logit_t, y_t, y_t_mask, t_mask[:, None, :])
+        cost_d = self.cross_entropy_loss_smooth(logit_d, y_d, None, None)
+        cost_co = self.cross_entropy_loss_smooth(logit_co, y_co, None, None)
+        cost_o = self.cross_entropy_loss_smooth(logit_o, y_o, None, None)
+        cost_c = self.cross_entropy_loss_smooth(logit_c, y_c, None, None)
+        cost_l = self.cross_entropy_loss_smooth(logit_l, y_l, None, None)
+        cost_nf = self.cross_entropy_loss_smooth(logit_nf, y_nf, None, None)
 
         cost = cost_column + cost_op + cost_agg + cost_vls + cost_vle + cost_vrs + cost_vre + \
             cost_cd + cost_vn + cost_t + cost_d + cost_co + cost_o + cost_c + cost_l + cost_nf
@@ -457,9 +502,9 @@ class NL2SQL(BaseModel):
 
         y_type1 = tensor.vector('y_type1', dtype="int32")
 
-        emb_type_0 = self.type_0_emb_layer.get_output(input_type_0).reshape([n_batch, n_seq, self.emb_dim / 3])
+        emb_type_0 = self.type_0_emb_layer.get_output(input_type_0).reshape([n_batch, n_seq, self.emb_dim - self.emb_dim / 3 - self.hid_dim / 2])
         emb_type_1 = self.type_1_emb_layer.get_output(input_type_1).reshape([n_batch, n_seq, self.emb_dim / 3])
-        emb_type_2 = self.type_2_emb_layer.get_output(input_type_2).reshape([n_batch, n_seq, self.emb_dim / 3])
+        emb_type_2 = self.type_2_emb_layer.get_output(input_type_2).reshape([n_batch, n_seq, self.hid_dim / 2])
 
         emb_type = tensor.concatenate([emb_type_0, emb_type_1, emb_type_2], axis=2)
 
@@ -1032,3 +1077,145 @@ class NL2SQL(BaseModel):
             comp_sql = comp_sql.replace(idx, sql)
 
         return comp_sql
+
+
+def test_bs_comp():
+    from config_default import simple_model_config
+    model = NL2SQL(simple_model_config)
+    model.init_model()
+    model.load("../data/save/simple_bert/val015-accuracy_0.006.npz")
+    # model.bert.load_partial("../roberta.base/new_roberta_base.npz", "bert_embeddings_word_embeddings_Wemb")
+    model.set_dropout_bert(False)
+    model.set_dropout(False)
+
+    from config_default import simple_val_config
+    from data import DataHolder
+
+    valid_holder = DataHolder(**simple_val_config)
+    valid_holder.batch_size = 1
+    valid_holder.read_data()
+    valid_holder.reset()
+
+    database = parse_table()
+
+    print "Build Sampler..."
+    model.build_sampler()
+    print "Build Finishied"
+
+    count = 0
+    fw = open("../data/test_comp_dev_20200804_nobs.sql", "w")
+
+    for data in valid_holder.get_batch_data():
+        count += 1
+        print count
+        if count == 429:
+            print "debug"
+        comp_sql = model.construct_comp_sql(data, database)
+        fw.write("%s\n" % comp_sql)
+
+
+
+def test_bs():
+    from config_default import simple_model_config
+    model = NL2SQL(simple_model_config)
+    model.init_model()
+    model.load("../data/save/reason_bert/val002-loss_3.834.npz")
+    model.bert.load_partial("../roberta.base/new_roberta_base.npz", "bert_embeddings_word_embeddings_Wemb")
+    model.set_dropout_bert(False)
+    model.set_dropout(False)
+
+    from config_default import simple_val_config
+    from data import DataHolder
+
+    valid_holder = DataHolder(**simple_val_config)
+
+    valid_holder.batch_size = 1
+    valid_holder.read_data()
+    valid_holder.reset()
+    database = parse_table()
+    print "Build Sampler..."
+    model.build_sampler()
+    print "Build Finishied"
+    f_dbid = open("../data/dev.db_id")
+    f_q = open("../data/clean_dev.question")
+    fw = open("../data/test_split_dev.sql", 'w')
+    for data in valid_holder.get_batch_data():
+        db_id = f_dbid.readline().strip()
+        q_toks = f_q.readline().strip().split()
+        table_dict = database[db_id]
+        input_sequence, input_mask, input_type_0, input_type_1, input_type_2, \
+        join_table, join_mask, separator, s_e_h, s_e_t, s_e_t_h, h2t_idx, \
+        q_mask, t_mask, p_mask, t_w_mask, t_h_mask, h_mask, h_w_mask, \
+        _, _, _, _, _, _, _, _, _, _, \
+        _, _, _, _, \
+        _, _, \
+        _, _, y_type1, _, _, _, _ = data
+
+        ctxs_q, ctxs_t, ctxs_h, ctxs_all, init_state_h, init_state_t, join_embs, prob_logit_co, prob_logit_d, prob_logit_o, prob_logit_c, prob_logit_l, prob_logit_nf = model.inf_encode(
+            [input_sequence, input_mask, input_type_0, input_type_1, input_type_2,
+             join_table, join_mask, separator, s_e_h, s_e_t, s_e_t_h, h2t_idx,
+             q_mask, t_mask, p_mask, t_w_mask, t_h_mask, h_w_mask, y_type1]
+        )
+
+        y_co = numpy.argmax(prob_logit_co, axis=1)
+        y_d = numpy.argmax(prob_logit_d, axis=1)
+        y_o = numpy.argmax(prob_logit_o, axis=1)
+        y_c = numpy.argmax(prob_logit_c, axis=1)
+        y_l = numpy.argmax(prob_logit_l, axis=1)
+        y_nf = numpy.argmax(prob_logit_nf, axis=1)
+
+        sql_dict = {
+            'distinct': y_d,
+            'connector': y_co,
+            'order': y_o,
+            'combine': y_c,
+            'limit': y_l,
+            'nested_from': y_nf,
+        }
+
+        table_seqs, table_scores = model.beam_search_table(
+            init_state_t, ctxs_q, q_mask, ctxs_t, t_mask, join_embs,
+        )
+
+        table_seq_idx = numpy.argmin(table_scores)
+        # table_seq_idx = numpy.argmin(table_scores / numpy.array([len(ts) for ts in table_seqs]))
+
+        sql_dict['from_table'] = table_seqs[table_seq_idx]
+
+        col_list = model.beam_search_column(
+            init_state_h, ctxs_all, input_mask, ctxs_q, q_mask, ctxs_h, h_mask
+        )
+
+        col_scores = numpy.array([col_dict['score'] for col_dict in col_list])
+        col_scores = col_scores / numpy.array([len([col_dict['s_column']]) for col_dict in col_list])
+
+        sql_dict.update(col_list[numpy.argmin(col_scores)])
+
+        sql_result = get_plat_sql(sql_dict, q_toks, table_dict, 0, 0, 0, 0, 0, [])
+        sql = sql_result[0]
+        fw.write("%s\n" % sql)
+
+
+if __name__ == '__main__':
+    test_bs_comp()
+    # test_bs()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

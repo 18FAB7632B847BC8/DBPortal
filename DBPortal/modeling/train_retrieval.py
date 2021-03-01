@@ -1,8 +1,8 @@
 from RetrievalModel import RetrievalModel
 from data_retrieval import RetrievalHolder
-import time
 import numpy
 import logging
+import time
 
 
 logging.basicConfig(level=logging.INFO,
@@ -13,11 +13,8 @@ logging.basicConfig(level=logging.INFO,
 
 class Trainer(object):
     def __init__(self, model_type, config, model_config, train_data_config, valid_data_config):
-        if model_type == 'retrieval':
-            self.model = RetrievalModel(config=model_config)
-        else:
-            raise ValueError('invalid model type')
-        self.model_type = model_type
+        self.model = RetrievalModel(model_config)
+        self.mode_type = model_type
         self.data_holder = RetrievalHolder(**train_data_config)
         self.valid_holder = RetrievalHolder(**valid_data_config)
 
@@ -26,8 +23,7 @@ class Trainer(object):
         self.ectr = 0  # epoch ctr
         self.vctr = 0  # validation ctr
         self.early_bad = 0  # early-stop counter
-
-        self.num_checkpoint = 1000
+        self.grads = []
 
         self.save_best_n = config.get('save_best_n', 10)  # Keep N best validation models on disk
         self.max_updates = config.get('max_updates', 0)  # Training stops if uctr hits 'max_updates'
@@ -37,22 +33,23 @@ class Trainer(object):
         self.patience = config.get('patience', 20)  # Stop training if no improvement after this validations
         self.valid_start = config.get('valid_start', 20)  # Start validation at epoch 'valid_start'
         self.dump_frequency = config.get('dump_frequency', 5000)
-        self.log_path = '../logs/%s.log' % self.model_type
-        self.metrics = config.get('metrics', ['loss'])
-        self.early_metric = config.get('early_metric', 'loss')
+        self.log_path = '../logs/%s.log' % self.mode_type
+        self.metrics = config.get('metrics', ['loss', 'accuracy'])
+        self.early_metric = config.get('early_metric', 'accuracy')
         self.f_valid = config.get('f_valid', 1000)  # Validation frequency in terms of updates
         self.epoch_valid = (self.f_valid == 0)  # 0: end of epochs
         # self.valid_save_hyp = train_args.valid_save_hyp  # save validation hypotheses under 'valid_hyps' folder
         self.f_verbose = config.get('f_verbose', 1)  # Print frequency
         self.decay_c = config.get('decay_c', 0.)
+        self.num_accumulate = int(config.get('num_accumulate', 8))
         self.epoch_losses = []
+        self.valid_mode = "simple"
 
         # Multiple comma separated metrics are supported
         # Each key is a metric name, values are metrics so far.
         self.valid_metrics = dict()
         if self.f_valid >= 0:
             # NOTE: This is relevant only for fusion models + WMTIterator
-            self.valid_mode = self.model.valid_mode
 
             # first one is for early-stopping
 
@@ -67,7 +64,7 @@ class Trainer(object):
 
             if self.early_metric in ['loss', 'px', 'ter']:
                 self.early_metric_larger_better = False
-            elif self.early_metric in ['bleu', 'meteor', 'cider', 'rouge']:
+            elif self.early_metric in ['bleu', 'meteor', 'cider', 'rouge', 'accuracy']:
                 self.early_metric_larger_better = True
             else:
                 raise KeyError('metric %s invalid' % self.early_metric)
@@ -75,42 +72,60 @@ class Trainer(object):
     def prepare(self):
 
         self.model.init_model()
-        # logging.info("Loading pretrained Model to %s" % self.model.bert.name)
-        # self.model.bert.from_pretrained_bert("../data/bert/bert_wmm.npz")
-        # logging.info("Loading pretrained Bert to %s" % self.model.bert_c.name)
-        # self.model.bert_c.from_pretrained_bert("../data/bert/bert_wmm.npz")
-        # self.model.load("../data/save/starbucks/epoch_40_model.npz")
+        # logging.info("Loading pretrained Model to %s" % self.mode_type)
+
         logging.info("Loading pretrained Model to %s" % self.model.bert.name)
-        # self.model.bert.from_pretrained_bert("../data/bert/bert_base.npz", ignore="type")
-        self.model.bert.from_pretrained_bert("../../NeuralFSM/bert.base/new_bert_base.npz", ignore="type")
+        pretrained_model_path = "../bert.base/bert_base.npz"
+        self.model.bert.from_pretrained_bert("%s" % pretrained_model_path)
+        """
+        if self.model.bert.encoder_num >= 12:
+            logging.info("Loading pretrained Model to %s" % self.model.bert.name)
+            self.model.bert.from_pretrained_bert("../grappa.large/new_grappa_large.npz")
+        else:
+            logging.info("No pre-trained encoder")
+        """
+
+        # logging.info("Loading Checkpoint Model to %s" % "../data/save/reason_bert/val001-loss_3.841.npz")
+        # self.model.load("../data/save/reason_bert/val001-loss_3.841.npz")
         if self.model.dont_update is None:
             self.model.dont_update = set()
-        
-        for k in self.model.tparams:
-            # if 'bert' in k and 'type' not in k and '10' not in k and '11' not in k:
-            if 'bert' in k and 'type' not in k:
-                self.model.dont_update.add(k)
+        # for k in self.model.tparams:
+        #     if 'bert' in k and 'outer' not in k:
+        #         self.model.dont_update.add(k)
+                # flag = True
+                # for i in range(6, 12):
+                #     if str(i) in k:
+                #         flag = False
+                #         break
+                # if flag is True:
+                #     self.model.dont_update.add(k)
+
         logging.info('loading traing data...')
         self.data_holder.read_data()
 
         logging.info('loading valid data...')
         self.valid_holder.read_data()
         self.valid_holder.reset()
-
         logging.info('build model...')
         data_loss = self.model.build_model()
-
         logging.info('build valid...')
         self.model.build_valid()
-
         reg_loss = []
         if self.decay_c > 0:
             reg_loss.append(self.model.get_l2_weight_decay(self.decay_c))
 
         reg_loss = sum(reg_loss) if len(reg_loss) > 0 else None
         logging.info('build optimizer...')
-        self.model.build_optimizer(data_loss, reg_loss, debug=False)
-        # self.model.build_optimizer_bert(data_loss, reg_loss)
+        # self.model.build_optimizer_asc(data_loss, reg_loss)
+        self.model.build_optimizer_bert_asc(data_loss, reg_loss)
+        """
+        if self.model.bert.encoder_num >= 12:
+            logging.info('build optimizer bert')
+            self.model.build_optimizer_bert_asc(data_loss, reg_loss)
+        else:
+            logging.info('build optimizer...')
+            self.model.build_optimizer_asc(data_loss, reg_loss, debug=False)
+        """
 
     def __is_last_best(self):
         value_list = self.valid_metrics[self.early_metric]
@@ -165,17 +180,24 @@ class Trainer(object):
         self.data_holder.reset()
         for data in self.data_holder.get_batch_data():
             self.uctr += 1
+            rval = self.model.forward(*data)
+            grads = rval[1:]
+            loss = rval[0]
+            if not self.grads:
+                self.grads = [numpy.array(g) for g in grads]
+            else:
+                assert len(grads) == len(self.grads)
+                for i in range(len(grads)):
+                    self.grads[i] += grads[i]
+            if self.uctr % self.num_accumulate == 0:
+                gs = [g / self.num_accumulate for g in self.grads]
+                self.model.backword(*gs)
+                self.grads = []
 
-            loss = self.model.train_batch(*data)
             batch_losses.append(loss)
             # Verbose
             if self.uctr % self.f_verbose == 0:
                 logging.info("Epoch: %6d, update: %7d, cost: %10.6f" % (self.ectr, self.uctr, loss))
-
-            if self.uctr % self.dump_frequency == 0:
-                self.model.save('checkpoint_model.npz')
-                with open(self.log_path, 'a') as log_file:
-                    log_file.write("Epoch: %6d, update: %7d, cost: %10.6f\n" % (self.ectr, self.uctr, loss))
 
             # Should we stop
             if self.uctr == self.max_updates:
@@ -218,24 +240,21 @@ class Trainer(object):
     def __do_validation(self):
         if self.ectr >= self.valid_start:
             logging.info('Do validation')
-
+            self.model.save('checkpoint_model.npz')
             self.vctr += 1
 
-            # Compute validation loss
             self.model.set_dropout(False)
             self.model.set_dropout_bert(False)
-            cur_loss = self.model.val_retrieval_loss(self.valid_holder)
+            cur_loss = 1. - self.model.val_loss(self.valid_holder)
+
             self.model.set_dropout(True)
-            self.model.set_dropout_bert(self.model.config.get('use_dropout_bert', False))
+            self.model.set_dropout_bert(True)
 
             # Add val_loss
             self.valid_metrics['loss'].append(cur_loss)
 
             # Print validation loss
-            logging.info("Validation %3d - LOSS = %.3f (PPL: %.3f)" % (self.vctr, cur_loss, numpy.exp(cur_loss)))
-            #############################
-            # Are we doing beam search? #
-            #############################
+            # logging.info("Validation %3d - Match Accuracy = %.3f" % (self.vctr, valid_results))
 
             # Is this the best evaluation based on early-stop metric?
             if self.__is_last_best():
@@ -252,17 +271,11 @@ class Trainer(object):
             last_v = self.valid_metrics[k][-1]
             if k in ['loss', 'px', 'ter']:
                 best_v = min(v_list)
-            elif k in ['bleu', 'meteor', 'cider', 'rouge']:
+            elif k in ['bleu', 'meteor', 'cider', 'rouge', 'accuracy']:
                 best_v = max(v_list)
             else:
                 best_v = last_v
-            if k == 'loss':
-                ppl = '(PPL: %.3f)' % numpy.exp(best_v)
-                ppl_last = '(PPL: %.3f)' % numpy.exp(last_v)
-            else:
-                ppl = ' '
-                ppl_last = ' '
-            logging.info('Current BEST %s = %.3f %s, Last %s = %.3f %s' % (k, best_v, ppl, k, last_v, ppl_last))
+            logging.info('Current BEST %s = %.3f, Last %s = %.3f' % (k, best_v, k, last_v))
 
         logging.info('Model Saved Path: %s' % self.model.save_path)
 
@@ -272,13 +285,10 @@ class Trainer(object):
         mean_loss = numpy.array(losses).mean()
         self.epoch_losses.append(mean_loss)
 
-        logging.info("--> Epoch %d finished with mean loss %.5f (PPL: %4.5f)" % (self.ectr, mean_loss,
-                                                                                 numpy.exp(mean_loss)))
+        logging.info("--> Epoch %d finished with mean loss %.5f" % (self.ectr, mean_loss))
         logging.info("--> Epoch took %.3f minutes, %.3f sec/update" % ((epoch_time / 60.0), update_time))
 
     def run(self):
-
-        self.model.set_dropout(True)
         while self.__train_epoch():
             pass
 

@@ -29,7 +29,8 @@ class BaseModel(object):
         self.use_bert_dropout = theano.shared(numpy.float32(config.get('use_bert_dropout', True)))
         self.warmup_steps = config.get('warmup_steps', 10000)
         self.decay_steps = config.get('decay_steps', 1e+7)
-        self.layers = []
+        self.train_mode = config.get('train_mode', "inner")
+        self.margin = config.get('margin', 0.3)
         self.f_log_probs = None
         self.train_batch = None
         self.forward = None
@@ -173,20 +174,20 @@ class BaseModel(object):
             for key, value in self.tparams.iteritems():
                 if key not in self.dont_update:
                     if 'bert' in key.lower():
-                        logging.info("Update BERT parameter: %s" % key)
+                        logging.info("Update BERT parameter: %s, %s" % (key, value.get_value().shape))
                         tparams_bert[key] = value
                     else:
-                        logging.info("Update Other parameter: %s" % key)
+                        logging.info("Update Other parameter: %s, %s" % (key, value.get_value().shape))
                         tparams[key] = value
                 else:
                     logging.info("Don't update key: %s" % key)
         else:
             for key, value in self.tparams.iteritems():
                 if 'bert' in key.lower():
-                    logging.info("Update BERT parameter: %s" % key)
+                    logging.info("Update BERT parameter: %s, %s" % (key, value.get_value().shape))
                     tparams_bert[key] = value
                 else:
-                    logging.info("Update Other parameter: %s" % key)
+                    logging.info("Update Other parameter: %s, %s" % (key, value.get_value().shape))
                     tparams[key] = value
 
         # Our final cost
@@ -250,7 +251,7 @@ class BaseModel(object):
         # Get gradients of cost with respect to variables
         # This uses final_cost which is not normalized w.r.t sentence lengths
         for k in tparams:
-            logging.info("Update parameter: %s" % k)
+            logging.info("Update Other parameter: %s, %s" % (k, tparams[k].get_value().shape))
         grads = tensor.grad(final_cost, wrt=list(tparams.values()))
 
         # Clip gradients if requested
@@ -327,95 +328,95 @@ class BaseModel(object):
         self.forward = theano.function(list(self.inputs.values()), [final_cost] + grads + grads_bert)
         self.backword = theano.function(grads + grads_bert, None, updates=updates + updates_bert)
 
-    def val_loss(self, valid_holder, simple=True):
-        if simple:
-            loss = []
-            loss_column = []
-            loss_op = []
-            loss_agg = []
-            loss_vls = []
-            loss_vle = []
-            loss_vrs = []
-            loss_vre = []
-            loss_cd = []
-            loss_vn = []
-            loss_t = []
-            loss_d = []
-            loss_co = []
-            loss_o = []
-            loss_c = []
-            loss_l = []
-            loss_nf = []
+    def val_loss(self, valid_holder):
+        total_count = 0
+        if self.train_mode == "inner":
+            logging.info("Training mode: Inner")
+            right_count = 0
             for data in valid_holder.get_batch_data():
-                input_sequence, input_mask, input_type_0, input_type_1, input_type_2, \
-                join_table, join_mask, separator, s_e_h, s_e_t, s_e_t_h, h2t_idx, \
-                q_mask, t_mask, p_mask, t_w_mask, t_h_mask, h_mask, h_w_mask, \
-                y_column, y_type2, y_agg, y_op, y_vls, y_vle, y_vrs, y_vre, y_cd, y_vn, \
-                y_c_mask, y_cw_mask, y_w_mask, y_cwo_mask, \
-                y_t, y_t_mask, \
-                y_co, y_d, y_type1, y_o, y_c, y_l, y_nf = data
+                x_q, x_q_mask, x_c, x_c_mask, t_mask, join_paths = data
 
-                norm_c = y_c_mask.sum(1)
-                norm_cw = y_cw_mask.sum(1)
-                norm_w = y_w_mask.sum(1)
-                norm_cwo = y_cwo_mask.sum(1)
-                norm_t = y_t_mask.sum(1)
+                t_mask[:, 0] = 0.
+                cosines = self.f_log_probs(x_q, x_q_mask, x_c, x_c_mask)  # n_sample, n_table
+                cosines *= t_mask
+                for cosine, join_path in zip(cosines, join_paths):
+                    total_count += 1
+                    right_count += int(all(cosine[join_path] >= self.margin))
+        elif self.train_mode == "all":
+            logging.info("Training mode: All")
+            right_count = 0
+            embs_q = []
+            embs_c = []
 
-                valid_dict = self.f_log_probs(*data)
-                cost_column = valid_dict["cost_column"] / norm_c
-                cost_op = valid_dict["cost_op"] / norm_w
-                cost_agg = valid_dict["cost_agg"] / norm_cwo
-                cost_vls = valid_dict["cost_vls"] / norm_w
-                cost_vle = valid_dict["cost_vle"] / norm_w
-                cost_vrs = valid_dict["cost_vrs"] / norm_w
-                cost_vre = valid_dict["cost_vre"] / norm_w
-                cost_cd = valid_dict["cost_cd"] / norm_cw
-                cost_vn = valid_dict["cost_vn"] / norm_w
-                cost_t = valid_dict["cost_t"] / norm_t
-                cost_d = valid_dict["cost_d"]
-                cost_co = valid_dict["cost_co"]
-                cost_o = valid_dict["cost_o"]
-                cost_c = valid_dict["cost_c"]
-                cost_l = valid_dict["cost_l"]
-                cost_nf = valid_dict["cost_nf"]
-                cost = cost_column + cost_op + cost_agg + cost_vls + cost_vle + cost_vrs + cost_vre + \
-                    cost_cd + cost_vn + cost_t + cost_d + cost_co + cost_o + cost_c + cost_l + cost_nf
-                loss.extend(cost)
-                loss_column.extend(cost_column)
-                loss_op.extend(cost_op)
-                loss_agg.extend(cost_agg)
-                loss_vls.extend(cost_vls)
-                loss_vle.extend(cost_vle)
-                loss_vrs.extend(cost_vrs)
-                loss_vre.extend(cost_vre)
-                loss_cd.extend(cost_cd)
-                loss_vn.extend(cost_vn)
-                loss_t.extend(cost_t)
-                loss_d.extend(cost_d)
-                loss_co.extend(cost_co)
-                loss_o.extend(cost_o)
-                loss_c.extend(cost_c)
-                loss_l.extend(cost_l)
-                loss_nf.extend(cost_nf)
-            return {
-                "loss": numpy.array(loss).mean(),
-                "loss_column": numpy.array(loss_column).mean(),
-                "loss_op": numpy.array(loss_op).mean(),
-                "loss_agg": numpy.array(loss_agg).mean(),
-                "loss_vls": numpy.array(loss_vls).mean(),
-                "loss_vle": numpy.array(loss_vle).mean(),
-                "loss_vrs": numpy.array(loss_vrs).mean(),
-                "loss_vre": numpy.array(loss_vre).mean(),
-                "loss_cd": numpy.array(loss_cd).mean(),
-                "loss_vn": numpy.array(loss_vn).mean(),
-                "loss_t": numpy.array(loss_t).mean(),
-                "loss_d": numpy.array(loss_d).mean(),
-                "loss_co": numpy.array(loss_co).mean(),
-                "loss_o": numpy.array(loss_o).mean(),
-                "loss_c": numpy.array(loss_c).mean(),
-                "loss_l": numpy.array(loss_l).mean(),
-                "loss_nf": numpy.array(loss_nf).mean()
-            }
+            for data in valid_holder.get_batch_data():
+                x_q, x_q_mask, x_c, x_c_mask, t_mask, _ = data
+                f_output = self.f_log_probs(x_q, x_q_mask, x_c, x_c_mask)
+                emb_q = f_output['emb_q'].tolist()  # n_batch, dim
+                emb_c = f_output['emb_c'].tolist()  # n_batch, n_table, dim
+                embs_q.extend([numpy.array(emb) for emb in emb_q])
+                for emb, mask in zip(emb_c, t_mask):
+                    # n_table, dim
+                    embs_c.append(numpy.array(emb)[1:int(sum(mask))])
+
+            sim = numpy.zeros((len(embs_q), len(embs_c)), dtype="float32")
+            for i, emb_q in enumerate(embs_q):
+                emb_q_norm = emb_q / numpy.sqrt((emb_q ** 2).sum(-1, keepdims=True))  # 1024
+                for j, emb_c in enumerate(embs_c):
+                    emb_c_norm = emb_c / numpy.sqrt((emb_c ** 2).sum(-1, keepdims=True))  # n_table, 1024
+                    sim[i, j] = ((emb_q_norm[None, :] * emb_c_norm).sum(-1)).max()
+            eps = numpy.diag(1e-6 * numpy.ones((len(embs_q),)))
+            sim += eps
+            ranks = sim.argsort(axis=1)  # 1000 * 1000
+
+            for j, rank in enumerate(ranks):
+                total_count += 1
+                r = len(rank) - int(numpy.argwhere(rank == j)) - 1
+                if r == 0:
+                    right_count += 1
+        else:
+            raise
+        return float(right_count) / float(total_count)
+
+    def val_loss_simple(self, valid_holder):
+        if self.train_mode == "all":
+            logging.info("Training mode: All")
+            right_count = 0
+            embs_q = []
+            embs_c = []
+
+            for data in valid_holder.get_batch_data():
+                x_q, x_q_mask, x_c, x_c_mask, t_mask, _ = data
+                f_output = self.f_log_probs(x_q, x_q_mask, x_c, x_c_mask)
+                emb_q = f_output['emb_q'].tolist()  # n_batch, dim
+                emb_c = f_output['emb_c'].tolist()  # n_batch, n_table, dim
+                embs_q.extend([numpy.array(emb) / numpy.sqrt((numpy.array(emb) ** 2).sum(-1, keepdims=True)) for emb in emb_q])
+                for emb, mask in zip(emb_c, t_mask):
+                    # n_table, dim
+                    emb = emb[0]
+                    embs_c.append(numpy.array(emb) / numpy.sqrt((numpy.array(emb) ** 2).sum(-1, keepdims=True)))
+            embs_q = numpy.array(embs_q)
+            embs_c = numpy.array(embs_c)
+            eps = numpy.diag(1e-6 * numpy.ones(1000,))
+            for i in range(5):
+                emb_q = embs_q[i * 1000:i * 1000 + 1000]  # 1000, 768
+                emb_c = embs_c[i * 1000:i * 1000 + 1000]  # 1000, 768
+                sim = numpy.dot(emb_q, emb_c.T)  # 1000, 1000
+                sim += eps
+                ranks = sim.argsort(axis=1)  # 1000 * 1000
+                for j, rank in enumerate(ranks):
+                    r = len(rank) - int(numpy.argwhere(rank == j)) - 1
+                    if r == 0:
+                        right_count += 1
+
+            return float(right_count) / 5000.
+        else:
+            raise
+
+
+
+
+
+
 
 
 
